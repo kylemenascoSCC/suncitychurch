@@ -1,0 +1,25 @@
+services:
+  - type: web
+    name: slm-voting
+    runtime: python
+    plan: free
+    region: oregon
+    buildCommand: "pip install -r requirements.txt"
+    startCommand: "gunicorn app:app"
+    disk:
+      name: votingdb
+      mountPath: /var/data
+      sizeGB: 1
+    envVars:
+      - key: DB_PATH
+        value: /var/data/voting.db
+      - key: PYTHON_VERSION
+        value: 3.12.3
+      - key: ASANA_TOKEN
+        sync: false
+      - key: ADMIN_PASSWORD
+        sync: false
+      - key: SCHEDULE_TOKEN
+        generateValue: true
+      - key: FLASK_SECRET_KEY
+        generateValue: true

@@ -1,0 +1,121 @@
+{% extends "base.html" %}
+{% block title %}Admin{% endblock %}
+{% block content %}
+
+<section class="card">
+  <h1>Admin</h1>
+
+  {% if current_round %}
+    <p class="lead">
+      Round <strong>#{{ current_round.id }}</strong> is
+      <span class="pill pill-open">open</span>
+      since {{ current_round.created_at }} UTC.
+    </p>
+  {% else %}
+    <p class="lead">
+      No voting round is currently open. Click below to pull the latest
+      topics from Asana and start a new round.
+    </p>
+  {% endif %}
+
+  <div class="admin-actions">
+    <form method="post" action="{{ url_for('admin_start') }}">
+      <button type="submit" class="btn-primary">
+        {{ 'Start a new round (replaces current)' if current_round else 'Start new round' }}
+      </button>
+    </form>
+    {% if current_round %}
+    <form method="post" action="{{ url_for('admin_close') }}"
+          onsubmit="return confirm('Close voting and post summary task to Asana?');">
+      <button type="submit" class="btn-danger">Close voting &amp; post to Asana</button>
+    </form>
+    {% endif %}
+  </div>
+</section>
+
+{% if current_round %}
+<section class="card">
+  <h2>Who has voted</h2>
+  <ul class="voter-status">
+    {% for member in team %}
+      {% set voted = member.email in voted_emails %}
+      <li class="{{ 'voted' if voted else 'pending' }}">
+        <span class="status-dot"></span>
+        <span class="voter-name">{{ member.name }}</span>
+        <span class="voter-state">{{ 'Voted' if voted else 'Not yet' }}</span>
+        {% if voted %}
+        <form method="post" action="{{ url_for('admin_reset_voter') }}"
+              onsubmit="return confirm('Reset {{ member.name }}\'s votes?');">
+          <input type="hidden" name="voter_email" value="{{ member.email }}">
+          <button type="submit" class="btn-link">reset</button>
+        </form>
+        {% endif %}
+      </li>
+    {% endfor %}
+  </ul>
+  <p class="hint">
+    {{ voted_emails|length }} of {{ team|length }} have voted
+    ({{ votes_per_person }} votes each).
+  </p>
+</section>
+
+<section class="card">
+  <h2>Live results</h2>
+  {% if results and results[0].votes > 0 %}
+  <ol class="results">
+    {% for row in results %}
+    <li class="{{ 'is-top' if loop.index <= top_n else '' }}">
+      <div class="result-rank">#{{ loop.index }}</div>
+      <div class="result-body">
+        <div class="result-name">
+          {% if row.permalink_url %}
+            <a href="{{ row.permalink_url }}" target="_blank" rel="noopener">{{ row.name }}</a>
+          {% else %}
+            {{ row.name }}
+          {% endif %}
+        </div>
+        {% if row.voters %}
+          <div class="result-voters">{{ row.voters|join(', ') }}</div>
+        {% endif %}
+      </div>
+      <div class="result-votes">
+        <strong>{{ row.votes }}</strong>
+        <span>vote{{ '' if row.votes == 1 else 's' }}</span>
+      </div>
+    </li>
+    {% endfor %}
+  </ol>
+  <p class="hint">Top {{ top_n }} will be highlighted in the summary task posted to Asana.</p>
+  {% else %}
+  <p>No votes yet.</p>
+  {% endif %}
+</section>
+{% endif %}
+
+{% if history %}
+<section class="card">
+  <h2>Recent rounds</h2>
+  <table class="history">
+    <thead>
+      <tr><th>#</th><th>Created</th><th>Closed</th><th>Status</th><th>Summary task</th></tr>
+    </thead>
+    <tbody>
+    {% for h in history %}
+      <tr>
+        <td>{{ h.id }}</td>
+        <td>{{ h.created_at }}</td>
+        <td>{{ h.closed_at or '—' }}</td>
+        <td>{{ h.status }}</td>
+        <td>
+          {% if h.summary_task_gid %}
+            <a href="https://app.asana.com/0/{{ '1209071651749706' }}/{{ h.summary_task_gid }}" target="_blank" rel="noopener">open in Asana ↗</a>
+          {% else %}—{% endif %}
+        </td>
+      </tr>
+    {% endfor %}
+    </tbody>
+  </table>
+</section>
+{% endif %}
+
+{% endblock %}

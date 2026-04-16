@@ -1,0 +1,76 @@
+{% extends "base.html" %}
+{% block title %}Cast your votes{% endblock %}
+{% block content %}
+<section class="card">
+  <h1>Vote on this meeting's topics</h1>
+  <p class="lead">
+    Pick <strong>exactly {{ votes_per_person }} topics</strong> you most want us to tackle in the next
+    Strategic Leadership Meeting. If you submit again, your latest picks replace the prior ones.
+  </p>
+
+  <form method="post" action="{{ url_for('vote') }}" id="vote-form">
+    <fieldset class="voter-select">
+      <legend>Who are you?</legend>
+      <select name="voter_email" required>
+        <option value="">— Choose your name —</option>
+        {% for member in team %}
+          <option value="{{ member.email }}">
+            {{ member.name }}{% if member.email in voted_emails %} · already voted{% endif %}
+          </option>
+        {% endfor %}
+      </select>
+    </fieldset>
+
+    <fieldset class="topics">
+      <legend>Your {{ votes_per_person }} picks</legend>
+      <p class="hint"><span id="pick-counter">0</span> of {{ votes_per_person }} selected</p>
+      <ul class="topic-list">
+      {% for t in topics %}
+        <li class="topic">
+          <label>
+            <input type="checkbox" name="topic_id" value="{{ t.id }}" class="topic-check">
+            <div class="topic-body">
+              <div class="topic-name">{{ t.name }}</div>
+              {% if t.assignee_name %}
+                <div class="topic-meta">Raised by {{ t.assignee_name }}</div>
+              {% endif %}
+              {% if t.notes %}
+                <details class="topic-notes">
+                  <summary>Context</summary>
+                  <p>{{ t.notes }}</p>
+                </details>
+              {% endif %}
+            </div>
+          </label>
+        </li>
+      {% endfor %}
+      </ul>
+    </fieldset>
+
+    <div class="actions">
+      <button type="submit" id="submit-btn" disabled>Submit my votes</button>
+    </div>
+  </form>
+</section>
+
+<script>
+  (function () {
+    var limit = {{ votes_per_person }};
+    var form = document.getElementById('vote-form');
+    var boxes = form.querySelectorAll('.topic-check');
+    var counter = document.getElementById('pick-counter');
+    var submit = document.getElementById('submit-btn');
+
+    function update() {
+      var checked = form.querySelectorAll('.topic-check:checked');
+      counter.textContent = checked.length;
+      boxes.forEach(function (b) {
+        b.disabled = !b.checked && checked.length >= limit;
+      });
+      submit.disabled = checked.length !== limit;
+    }
+    boxes.forEach(function (b) { b.addEventListener('change', update); });
+    update();
+  })();
+</script>
+{% endblock %}

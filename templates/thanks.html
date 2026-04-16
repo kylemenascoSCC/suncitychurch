@@ -1,0 +1,13 @@
+{% extends "base.html" %}
+{% block title %}Thanks{% endblock %}
+{% block content %}
+<section class="card centered">
+  <h1>Votes recorded{% if voter %}, {{ voter.name.split(' ')[0] }}{% endif %}.</h1>
+  <p class="lead">
+    Your picks are in. Results will be posted back to Asana once the round closes.
+  </p>
+  <p>
+    <a class="btn-secondary" href="{{ url_for('vote') }}">Change my picks</a>
+  </p>
+</section>
+{% endblock %}
