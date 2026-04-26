@@ -4,12 +4,18 @@ Strategic Leadership Meeting — voting app
 Flask app that:
   1. Opens voting Sunday 5:00 PM Pacific by pulling the current tasks from
      the "Short Term Issues List" section of the Strategic Leadership
-     Meeting project in Asana.
+     Meeting project in Asana, and immediately creates a live "Issues
+     List Voting — Live (week of Mon M/D)" task in the
+     "Issues List Voting Results" section with an initial PDF showing
+     no one has voted yet.
   2. Lets each of the 7 leaders pick 2 topics via a simple web form.
-  3. Closes voting Monday 9:00 AM Pacific, generates a results PDF, and
-     posts one Asana task titled "Issues List Results <date>" into the
-     "Issues List Voting Results" section of the project, with the PDF
-     attached.
+     After EACH vote submission, the app regenerates the PDF (showing
+     who has voted / who hasn't / current vote tallies) and replaces the
+     attachment on the live task in Asana — old PDF is deleted, new PDF
+     is attached.
+  3. Closes voting Monday 9:00 AM Pacific. The same live task gets
+     renamed to "Issues List Results <date>" and gets one final PDF
+     replacement reflecting the closed results.
 
 Open/close are triggered by external scheduled GETs to /scheduled/open and
 /scheduled/close (see README). A password-gated /admin page is kept around
@@ -28,7 +34,9 @@ import io
 import os
 import sqlite3
 import secrets
-from datetime import datetime
+import threading
+import traceback
+from datetime import datetime, timedelta
 from functools import wraps
 
 import requests
@@ -72,6 +80,10 @@ LEADERSHIP_TEAM = [
 
 app = Flask(__name__)
 app.secret_key = os.environ.get("FLASK_SECRET_KEY", secrets.token_hex(32))
+
+# Serialise the "regenerate PDF + swap attachment" path so two near-
+# simultaneous votes don't race on the Asana attachment.
+_pdf_refresh_lock = threading.Lock()
 
 
 # --------------------------------------------------------------------------
@@ -151,6 +163,21 @@ def asana_post(path, json_body=None, files=None, data=None):
     return r.json()
 
 
+def asana_put(path, json_body=None):
+    r = requests.put(f"{ASANA_BASE}{path}", headers=_headers(),
+                     json=json_body, timeout=30)
+    r.raise_for_status()
+    return r.json()
+
+
+def asana_delete(path):
+    r = requests.delete(f"{ASANA_BASE}{path}", headers=_headers(), timeout=30)
+    # 200/204 both fine. 404 means already gone — treat as success.
+    if r.status_code not in (200, 204, 404):
+        r.raise_for_status()
+    return True
+
+
 def fetch_section_topics():
     """Pull live, incomplete tasks from the Short Term Issues List."""
     data = asana_get(
@@ -193,6 +220,17 @@ def create_results_task(title, notes, section_gid):
     return resp["data"]["gid"]
 
 
+def update_task(task_gid, name=None, notes=None):
+    payload = {}
+    if name is not None:
+        payload["name"] = name
+    if notes is not None:
+        payload["notes"] = notes
+    if not payload:
+        return None
+    return asana_put(f"/tasks/{task_gid}", json_body={"data": payload})
+
+
 def attach_pdf_to_task(task_gid, pdf_bytes, filename):
     resp = asana_post(
         "/attachments",
@@ -203,15 +241,61 @@ def attach_pdf_to_task(task_gid, pdf_bytes, filename):
 
 
 # --------------------------------------------------------------------------
+# Date / title helpers
+# --------------------------------------------------------------------------
+def upcoming_monday(now=None):
+    """Return the date of the upcoming Monday (today if Mon morning,
+    next Mon if Mon afternoon)."""
+    now = now or datetime.now()
+    weekday = now.weekday()  # 0=Mon ... 6=Sun
+    days_until = (7 - weekday) % 7  # 0 if today is Mon
+    if days_until == 0 and now.hour >= 12:
+        days_until = 7
+    return (now + timedelta(days=days_until)).date()
+
+
+def fmt_md(d):
+    """4/27 (no leading zeros). Linux/Mac. Falls back gracefully on Windows."""
+    try:
+        return d.strftime("%-m/%-d")
+    except (ValueError, TypeError):
+        return d.strftime("%m/%d")
+
+
+def fmt_long_date(d):
+    try:
+        return d.strftime("%B %-d, %Y")
+    except (ValueError, TypeError):
+        return d.strftime("%B %d, %Y")
+
+
+def live_task_title(now=None):
+    mon = upcoming_monday(now)
+    return f"Issues List Voting — Live (week of Mon {fmt_md(mon)})"
+
+
+def final_task_title(now=None):
+    return f"Issues List Results {fmt_long_date(now or datetime.now())}"
+
+
+# --------------------------------------------------------------------------
 # PDF generation
 # --------------------------------------------------------------------------
-def build_results_pdf(ranked, when_closed):
+def build_results_pdf(ranked, voted_email_set, when, is_final):
+    """Render the results PDF.
+
+    ranked: list of {name, votes, voters, permalink_url, ...}
+    voted_email_set: set of voter emails (lowercase) who have voted
+    when: datetime to render in the subtitle
+    is_final: True if this is the closed-voting final PDF, False if live
+    """
     buf = io.BytesIO()
     doc = SimpleDocTemplate(
         buf, pagesize=LETTER,
         leftMargin=0.75 * inch, rightMargin=0.75 * inch,
         topMargin=0.75 * inch, bottomMargin=0.75 * inch,
-        title="Strategic Leadership Meeting — Issues List Results",
+        title=("Strategic Leadership Meeting — Issues List "
+               + ("Results" if is_final else "Live Voting")),
     )
     styles = getSampleStyleSheet()
     h1 = ParagraphStyle(
@@ -220,11 +304,11 @@ def build_results_pdf(ranked, when_closed):
     )
     sub = ParagraphStyle(
         "sub", parent=styles["Normal"],
-        fontSize=11, textColor=colors.HexColor("#555555"), spaceAfter=18,
+        fontSize=11, textColor=colors.HexColor("#555555"), spaceAfter=14,
     )
     h2 = ParagraphStyle(
         "h2", parent=styles["Heading2"], fontSize=13,
-        spaceBefore=16, spaceAfter=8,
+        spaceBefore=14, spaceAfter=8,
     )
     body = ParagraphStyle(
         "body", parent=styles["Normal"], fontSize=10.5, leading=14,
@@ -235,25 +319,55 @@ def build_results_pdf(ranked, when_closed):
     )
 
     story = []
-    story.append(Paragraph("Issues List Results", h1))
-    story.append(Paragraph(
-        f"Strategic Leadership Meeting · voting closed "
-        f"{when_closed.strftime('%A, %B %-d, %Y at %-I:%M %p %Z').strip() or when_closed.strftime('%A, %B %d, %Y at %H:%M')}",
-        sub,
-    ))
 
-    total_voters = sum(1 for r in LEADERSHIP_TEAM if True)
+    if is_final:
+        story.append(Paragraph("Issues List Results", h1))
+        story.append(Paragraph(
+            f"Strategic Leadership Meeting · voting closed "
+            f"{when.strftime('%A, %B %-d, %Y at %-I:%M %p').strip()}",
+            sub,
+        ))
+    else:
+        story.append(Paragraph("Issues List — Live Voting", h1))
+        story.append(Paragraph(
+            f"Strategic Leadership Meeting · live as of "
+            f"{when.strftime('%A, %B %-d, %Y at %-I:%M %p').strip()} "
+            f"· voting closes Monday at 9:00 AM Pacific",
+            sub,
+        ))
+
+    # ---------- Voting status (top) ----------
+    voted_names = [m["name"] for m in LEADERSHIP_TEAM
+                   if m["email"].lower() in voted_email_set]
+    pending_names = [m["name"] for m in LEADERSHIP_TEAM
+                     if m["email"].lower() not in voted_email_set]
+    voted_names.sort()
+    pending_names.sort()
+
+    story.append(Paragraph("Voting status", h2))
+    story.append(Paragraph(
+        f"<b>Voted ({len(voted_names)} of {len(LEADERSHIP_TEAM)}):</b> "
+        + (", ".join(voted_names) if voted_names else "—"),
+        body,
+    ))
+    story.append(Paragraph(
+        f"<b>Not yet voted ({len(pending_names)}):</b> "
+        + (", ".join(pending_names) if pending_names else "—"),
+        body,
+    ))
+    story.append(Spacer(1, 0.05 * inch))
+
     total_votes = sum(row["votes"] for row in ranked)
     story.append(Paragraph(
-        f"Each leader cast up to {VOTES_PER_PERSON} votes. "
-        f"{total_votes} total vote(s) recorded.",
+        f"Each leader casts {VOTES_PER_PERSON} votes. "
+        f"{total_votes} total vote(s) recorded so far.",
         body,
     ))
 
-    # Top N table
+    # ---------- Top N table ----------
     story.append(Paragraph(f"Top {TOP_N_HIGHLIGHT} for discussion", h2))
     top = ranked[:TOP_N_HIGHLIGHT]
-    if top:
+    if top and any(r["votes"] > 0 for r in top):
         data = [["#", "Topic", "Votes", "Voted by"]]
         for i, row in enumerate(top, 1):
             voters = ", ".join(row["voters"]) if row["voters"] else "—"
@@ -277,9 +391,9 @@ def build_results_pdf(ranked, when_closed):
         ]))
         story.append(t)
     else:
-        story.append(Paragraph("No votes cast.", body))
+        story.append(Paragraph("No votes cast yet.", body))
 
-    # Full ranked list
+    # ---------- Full ranked list ----------
     story.append(Paragraph("Full ranked results", h2))
     data = [["#", "Topic", "Votes", "Voted by"]]
     for i, row in enumerate(ranked, 1):
@@ -304,7 +418,7 @@ def build_results_pdf(ranked, when_closed):
     ]))
     story.append(t)
 
-    story.append(Spacer(1, 0.25 * inch))
+    story.append(Spacer(1, 0.2 * inch))
     story.append(Paragraph("Source task links", h2))
     for row in ranked:
         if row["permalink_url"]:
@@ -317,6 +431,36 @@ def build_results_pdf(ranked, when_closed):
 
     doc.build(story)
     return buf.getvalue()
+
+
+def build_notes_text(ranked, voted_email_set, is_final):
+    """Plain-text notes used as the Asana task description."""
+    voted_names = sorted([m["name"] for m in LEADERSHIP_TEAM
+                          if m["email"].lower() in voted_email_set])
+    pending_names = sorted([m["name"] for m in LEADERSHIP_TEAM
+                            if m["email"].lower() not in voted_email_set])
+    state = "FINAL" if is_final else "Live (in progress)"
+    lines = [
+        f"Strategic Leadership Meeting — Issues List Voting [{state}]",
+        "",
+        f"Voted ({len(voted_names)} of {len(LEADERSHIP_TEAM)}): "
+        + (", ".join(voted_names) if voted_names else "—"),
+        f"Not yet voted ({len(pending_names)}): "
+        + (", ".join(pending_names) if pending_names else "—"),
+        "",
+    ]
+    if not is_final:
+        lines.append("Voting closes Monday at 9:00 AM Pacific.")
+        lines.append("")
+    lines.append(f"Top {TOP_N_HIGHLIGHT}:")
+    for i, row in enumerate(ranked[:TOP_N_HIGHLIGHT], 1):
+        lines.append(f"  {i}. {row['name']} — {row['votes']} vote(s)")
+    lines.append("")
+    lines.append("Full ranked:")
+    for row in ranked:
+        voters = ", ".join(row["voters"]) if row["voters"] else "—"
+        lines.append(f"  • {row['name']} — {row['votes']} vote(s) [{voters}]")
+    return "\n".join(lines)
 
 
 # --------------------------------------------------------------------------
@@ -363,7 +507,8 @@ def voted_emails(conn, round_id):
 
 
 def open_new_round(conn):
-    """Close any open round, pull fresh topics from Asana, open a new round."""
+    """Close any open round, pull fresh topics from Asana, open a new round,
+    and create the live Asana task with an initial PDF."""
     cur = conn.cursor()
     cur.execute(
         "UPDATE rounds SET status='closed', closed_at=? WHERE status='open'",
@@ -385,42 +530,127 @@ def open_new_round(conn):
              (t.get("assignee") or {}).get("name"), t.get("permalink_url")),
         )
     conn.commit()
+
+    # ----- Create the Asana live task with initial PDF -----
+    try:
+        section_gid = ensure_results_section_gid()
+        results = ranked_results(conn, round_id)
+        already_voted = voted_emails(conn, round_id)
+        now = datetime.now()
+        title = live_task_title(now)
+        notes = build_notes_text(results, already_voted, is_final=False)
+        task_gid = create_results_task(title, notes, section_gid)
+
+        pdf_bytes = build_results_pdf(results, already_voted, now, is_final=False)
+        filename = f"Issues List Voting — Live {fmt_md(upcoming_monday(now))}.pdf"
+        attachment_gid = attach_pdf_to_task(task_gid, pdf_bytes, filename)
+
+        conn.execute(
+            "UPDATE rounds SET summary_task_gid=?, attachment_gid=? WHERE id=?",
+            (task_gid, attachment_gid, round_id),
+        )
+        conn.commit()
+    except Exception as e:
+        # Don't fail the whole open if Asana is briefly unhappy — the round
+        # is still open and we can repair on first vote.
+        traceback.print_exc()
+        app.logger.warning("Live task creation failed: %s", e)
+
     return round_id, len(tasks)
 
 
+def refresh_live_pdf(conn, round_id):
+    """Replace the attachment on the live task with a fresh PDF reflecting
+    the current state. Best-effort: errors are swallowed and logged so a
+    flaky Asana call never blocks a vote."""
+    with _pdf_refresh_lock:
+        r = conn.execute("SELECT * FROM rounds WHERE id = ?",
+                         (round_id,)).fetchone()
+        if not r:
+            return
+        task_gid = r["summary_task_gid"]
+        old_attachment_gid = r["attachment_gid"]
+
+        results = ranked_results(conn, round_id)
+        already_voted = voted_emails(conn, round_id)
+        now = datetime.now()
+
+        try:
+            # If for some reason the live task wasn't created at open time,
+            # create it now (recovery path).
+            if not task_gid:
+                section_gid = ensure_results_section_gid()
+                title = live_task_title(now)
+                notes = build_notes_text(results, already_voted, is_final=False)
+                task_gid = create_results_task(title, notes, section_gid)
+
+            pdf_bytes = build_results_pdf(results, already_voted, now,
+                                          is_final=False)
+            filename = (f"Issues List Voting — Live "
+                        f"{fmt_md(upcoming_monday(now))}.pdf")
+
+            # Delete old attachment first (best-effort)
+            if old_attachment_gid:
+                try:
+                    asana_delete(f"/attachments/{old_attachment_gid}")
+                except Exception:
+                    traceback.print_exc()
+
+            new_attachment_gid = attach_pdf_to_task(task_gid, pdf_bytes,
+                                                    filename)
+
+            # Refresh the notes too so a quick glance in Asana shows the
+            # updated voter status.
+            try:
+                update_task(task_gid, notes=build_notes_text(
+                    results, already_voted, is_final=False))
+            except Exception:
+                traceback.print_exc()
+
+            conn.execute(
+                "UPDATE rounds SET summary_task_gid=?, attachment_gid=? "
+                "WHERE id=?",
+                (task_gid, new_attachment_gid, round_id),
+            )
+            conn.commit()
+        except Exception as e:
+            traceback.print_exc()
+            app.logger.warning("PDF refresh failed: %s", e)
+
+
 def close_round_and_publish(conn):
-    """Close the current round, publish the Asana task + PDF."""
+    """Close the current round. If the live task already exists in Asana,
+    rename it to the final title and replace the PDF one last time. If it
+    doesn't exist yet (legacy / open failed), create it now."""
     r = get_current_round(conn)
     if not r:
         raise RuntimeError("No open round to close.")
     round_id = r["id"]
+    task_gid = r["summary_task_gid"]
+    old_attachment_gid = r["attachment_gid"]
+
     results = ranked_results(conn, round_id)
-
-    # Friendly date (local to Pacific-labeled just in notes; the actual
-    # wall-clock time used is server UTC, rendered in Pacific for display).
+    already_voted = voted_emails(conn, round_id)
     now = datetime.now()
-    date_str = now.strftime("%B %-d, %Y") if os.name != "nt" else now.strftime("%B %d, %Y")
+    final_title = final_task_title(now)
+    final_notes = build_notes_text(results, already_voted, is_final=True)
 
-    # Notes = text fallback for anyone without PDF access
-    lines = [f"Strategic Leadership Meeting — voting results ({date_str})", ""]
-    lines.append(f"Top {TOP_N_HIGHLIGHT} for discussion:")
-    for i, row in enumerate(results[:TOP_N_HIGHLIGHT], 1):
-        lines.append(f"  {i}. {row['name']} — {row['votes']} vote(s)")
-    lines.append("")
-    lines.append("Full ranked results:")
-    for row in results:
-        voters = ", ".join(row["voters"]) if row["voters"] else "—"
-        lines.append(f"  • {row['name']} — {row['votes']} vote(s) [voted by: {voters}]")
-    notes = "\n".join(lines)
-    title = f"Issues List Results {date_str}"
+    if not task_gid:
+        section_gid = ensure_results_section_gid()
+        task_gid = create_results_task(final_title, final_notes, section_gid)
+    else:
+        # Rename + refresh notes on the existing live task
+        update_task(task_gid, name=final_title, notes=final_notes)
 
-    # Ensure target section exists, then create task in it
-    section_gid = ensure_results_section_gid()
-    task_gid = create_results_task(title, notes, section_gid)
+    pdf_bytes = build_results_pdf(results, already_voted, now, is_final=True)
+    filename = f"{final_title}.pdf"
 
-    # Generate PDF & attach
-    pdf_bytes = build_results_pdf(results, now)
-    filename = f"Issues List Results {date_str}.pdf"
+    if old_attachment_gid:
+        try:
+            asana_delete(f"/attachments/{old_attachment_gid}")
+        except Exception:
+            traceback.print_exc()
+
     attachment_gid = attach_pdf_to_task(task_gid, pdf_bytes, filename)
 
     conn.execute(
@@ -487,6 +717,14 @@ def vote():
                 (round_id, voter["email"], voter["name"], int(tid), now),
             )
         conn.commit()
+
+        # Refresh the live PDF in Asana. Best-effort: any failure is logged
+        # but doesn't block the voter's submission.
+        try:
+            refresh_live_pdf(conn, round_id)
+        except Exception:
+            traceback.print_exc()
+
         conn.close()
         return redirect(url_for("thanks", voter=voter["email"]))
 
@@ -645,6 +883,14 @@ def admin_reset_voter():
         (r["id"], email),
     )
     conn.commit()
+
+    # Refresh the live PDF after a reset so the Asana attachment reflects
+    # the new state immediately.
+    try:
+        refresh_live_pdf(conn, r["id"])
+    except Exception:
+        traceback.print_exc()
+
     conn.close()
     flash(f"Cleared votes for {email}.", "success")
     return redirect(url_for("admin"))
