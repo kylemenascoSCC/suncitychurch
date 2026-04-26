@@ -54,6 +54,8 @@ def fake_post(path, json_body=None, files=None, data=None):
     if path == "/attachments":
         _attachment_seq += 1
         return {"data": {"gid": f"ATT_GID_{_attachment_seq}"}}
+    if path.startswith("/sections/") and path.endswith("/addTask"):
+        return {"data": {}}
     raise AssertionError(f"unexpected asana_post: {path}")
 
 

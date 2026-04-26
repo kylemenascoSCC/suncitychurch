@@ -205,19 +205,30 @@ def ensure_results_section_gid():
 
 
 def create_results_task(title, notes, section_gid):
-    """Create a task directly in a section via memberships."""
+    """Create a task in the project, then move it into the target section.
+
+    NOTE: Asana rejects POST /tasks when both `projects` and `memberships`
+    are supplied for the same project, so we do a two-step:
+        1. Create the task in the project (top of project / default section)
+        2. Move it into the desired section via /sections/{sid}/addTask
+    """
     resp = asana_post("/tasks", json_body={
         "data": {
             "name": title,
             "notes": notes,
             "projects": [ASANA_PROJECT_ID],
-            "memberships": [{
-                "project": ASANA_PROJECT_ID,
-                "section": section_gid,
-            }],
         }
     })
-    return resp["data"]["gid"]
+    task_gid = resp["data"]["gid"]
+    try:
+        asana_post(
+            f"/sections/{section_gid}/addTask",
+            json_body={"data": {"task": task_gid}},
+        )
+    except Exception:
+        traceback.print_exc()
+        # Even if the section move fails, the task exists in the project.
+    return task_gid
 
 
 def update_task(task_gid, name=None, notes=None):
@@ -665,10 +676,45 @@ def close_round_and_publish(conn):
 # --------------------------------------------------------------------------
 # Voting routes
 # --------------------------------------------------------------------------
+def _in_voting_window(now=None):
+    """Returns True if current time is in the auto-open window:
+    Sunday 16:00 PT through Monday 09:00 PT.
+    Server runs in UTC; Pacific is UTC-7 (PDT) most of the year.
+    To avoid pulling in pytz, we approximate with a fixed offset that
+    covers DST (UTC-7). For Apr–Oct (PDT) this is exact; in winter
+    (PST = UTC-8) it shifts the window by an hour, which is fine for
+    a soft auto-open guard."""
+    now = now or datetime.utcnow()
+    pt = now - timedelta(hours=7)  # PDT
+    wd = pt.weekday()  # 0=Mon .. 6=Sun
+    # Sunday 16:00 onward
+    if wd == 6 and pt.hour >= 16:
+        return True
+    # Monday before 09:00
+    if wd == 0 and pt.hour < 9:
+        return True
+    return False
+
+
+def _ensure_round_open(conn):
+    """If no open round and we're in the voting window, auto-open one.
+    This makes the app self-healing against ephemeral-disk wipes on
+    Render free tier."""
+    r = get_current_round(conn)
+    if r or not _in_voting_window():
+        return r
+    try:
+        open_new_round(conn)
+        return get_current_round(conn)
+    except Exception:
+        traceback.print_exc()
+        return None
+
+
 @app.route("/")
 def home():
     conn = get_db()
-    r = get_current_round(conn)
+    r = _ensure_round_open(conn)
     conn.close()
     if r:
         return redirect(url_for("vote"))
@@ -678,7 +724,7 @@ def home():
 @app.route("/vote", methods=["GET", "POST"])
 def vote():
     conn = get_db()
-    r = get_current_round(conn)
+    r = _ensure_round_open(conn)
     if not r:
         conn.close()
         return render_template("no_round.html")
@@ -787,6 +833,40 @@ def scheduled_close():
 @app.route("/healthz")
 def healthz():
     return "ok", 200
+
+
+@app.route("/_debug")
+def _debug():
+    """Diagnostic — dumps DB path, file presence, rows in rounds.
+    Gated by SCHEDULE_TOKEN."""
+    _check_schedule_auth()
+    info = {
+        "db_path": DB_PATH,
+        "db_path_abs": os.path.abspath(DB_PATH),
+        "cwd": os.getcwd(),
+        "db_exists": os.path.exists(DB_PATH),
+        "db_size": os.path.getsize(DB_PATH) if os.path.exists(DB_PATH) else None,
+        "process_pid": os.getpid(),
+    }
+    try:
+        conn = get_db()
+        rounds = [dict(r) for r in conn.execute(
+            "SELECT id, status, created_at, closed_at, summary_task_gid, "
+            "attachment_gid FROM rounds ORDER BY id"
+        ).fetchall()]
+        topics_count = conn.execute(
+            "SELECT COUNT(*) AS c FROM topics"
+        ).fetchone()["c"]
+        votes_count = conn.execute(
+            "SELECT COUNT(*) AS c FROM votes"
+        ).fetchone()["c"]
+        conn.close()
+        info["rounds"] = rounds
+        info["topics_count"] = topics_count
+        info["votes_count"] = votes_count
+    except Exception as e:
+        info["db_error"] = str(e)
+    return jsonify(info)
 
 
 # --------------------------------------------------------------------------
