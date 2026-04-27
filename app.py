@@ -90,9 +90,15 @@ _pdf_refresh_lock = threading.Lock()
 # Database
 # --------------------------------------------------------------------------
 def get_db():
-    conn = sqlite3.connect(DB_PATH)
+    # Use the absolute path so every worker resolves to the same file
+    # regardless of cwd.
+    abs_path = os.path.abspath(DB_PATH)
+    conn = sqlite3.connect(abs_path, timeout=30, isolation_level=None)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
+    # WAL mode lets multiple workers see each other's commits immediately.
+    conn.execute("PRAGMA journal_mode = WAL")
+    conn.execute("PRAGMA synchronous = NORMAL")
     return conn
 
 
@@ -811,10 +817,11 @@ def scheduled_open():
     try:
         round_id, n = open_new_round(conn)
         conn.close()
-        return jsonify(ok=True, round_id=round_id, topic_count=n)
+        return jsonify(ok=True, round_id=round_id, topic_count=n,
+                       pid=os.getpid())
     except Exception as e:
         conn.close()
-        return jsonify(ok=False, error=str(e)), 500
+        return jsonify(ok=False, error=str(e), pid=os.getpid()), 500
 
 
 @app.route("/scheduled/close", methods=["GET", "POST"])
@@ -824,10 +831,11 @@ def scheduled_close():
     try:
         task_gid, attachment_gid = close_round_and_publish(conn)
         conn.close()
-        return jsonify(ok=True, task_gid=task_gid, attachment_gid=attachment_gid)
+        return jsonify(ok=True, task_gid=task_gid,
+                       attachment_gid=attachment_gid, pid=os.getpid())
     except Exception as e:
         conn.close()
-        return jsonify(ok=False, error=str(e)), 500
+        return jsonify(ok=False, error=str(e), pid=os.getpid()), 500
 
 
 @app.route("/healthz")
